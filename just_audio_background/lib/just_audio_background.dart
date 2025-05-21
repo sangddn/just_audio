@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math';
 
 import 'package:audio_service/audio_service.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio_platform_interface/just_audio_platform_interface.dart';
@@ -12,6 +13,7 @@ export 'package:audio_service/audio_service.dart' show MediaItem;
 
 late SwitchAudioHandler _audioHandler;
 late JustAudioPlatform _platform;
+late AudioNotificationConfigBuilder _notificationConfigBuilder;
 
 /// Provides the [init] method to initialise just_audio for background playback.
 class JustAudioBackground {
@@ -49,6 +51,7 @@ class JustAudioBackground {
     Duration rewindInterval = const Duration(seconds: 10),
     bool preloadArtwork = false,
     Map<String, dynamic>? androidBrowsableRootExtras,
+    AudioNotificationConfigBuilder? notificationConfigBuilder,
   }) async {
     WidgetsFlutterBinding.ensureInitialized();
     await _JustAudioBackgroundPlugin.setup(
@@ -70,6 +73,7 @@ class JustAudioBackground {
       rewindInterval: rewindInterval,
       preloadArtwork: preloadArtwork,
       androidBrowsableRootExtras: androidBrowsableRootExtras,
+      notificationConfigBuilder: notificationConfigBuilder,
     );
   }
 }
@@ -92,8 +96,11 @@ class _JustAudioBackgroundPlugin extends JustAudioPlatform {
     Duration rewindInterval = const Duration(seconds: 10),
     bool preloadArtwork = false,
     Map<String, dynamic>? androidBrowsableRootExtras,
+    AudioNotificationConfigBuilder? notificationConfigBuilder,
   }) async {
     _platform = JustAudioPlatform.instance;
+    _notificationConfigBuilder = notificationConfigBuilder ??
+        _PlayerAudioHandler.defaultNotificationConfigBuilder;
     JustAudioPlatform.instance = _JustAudioBackgroundPlugin();
     _audioHandler = await AudioService.init(
       builder: () => SwitchAudioHandler(BaseAudioHandler()),
@@ -378,6 +385,35 @@ class _PlayerAudioHandler extends BaseAudioHandler
 
   List<MediaItem> get currentQueue => queue.value;
   StreamSubscription<TrackInfo>? _trackInfoSubscription;
+
+  /// Default notification builder
+  /// Showing skip, play/pause and stop buttons if applicable.
+  /// Stop button is hidden from android compact view.
+  static AudioNotificationConfig defaultNotificationConfigBuilder(
+    AudioHandler handler,
+    bool hasPrevious,
+    bool hasNext,
+  ) {
+    final isPlaying = handler.playbackState.value.playing;
+    final controls = [
+      if (hasPrevious) MediaControl.skipToPrevious,
+      if (isPlaying) MediaControl.pause else MediaControl.play,
+      MediaControl.stop,
+      if (hasNext) MediaControl.skipToNext,
+    ];
+    return AudioNotificationConfig(
+      controls: controls,
+      systemActions: const {
+        MediaAction.seek,
+        MediaAction.seekForward,
+        MediaAction.seekBackward,
+      },
+      androidCompactActionIndices: List.generate(
+        controls.length,
+        (i) => i,
+      )..removeAt(controls.indexOf(MediaControl.stop)),
+    );
+  }
 
   Future<void> _initPlayer(InitRequest initRequest) =>
       _lock.synchronized(() async {
@@ -765,44 +801,36 @@ class _PlayerAudioHandler extends BaseAudioHandler
 
   /// Broadcasts the current state to all clients.
   void _broadcastState() {
-    final controls = [
-      if (hasPrevious) MediaControl.skipToPrevious,
-      if (_playing) MediaControl.pause else MediaControl.play,
-      MediaControl.stop,
-      if (hasNext) MediaControl.skipToNext,
-    ];
-    playbackState.add(playbackState.nvalue!.copyWith(
-      controls: controls,
-      systemActions: {
-        MediaAction.seek,
-        MediaAction.seekForward,
-        MediaAction.seekBackward,
-      },
-      androidCompactActionIndices: List.generate(controls.length, (i) => i)
-          .where((i) => controls[i].action != MediaAction.stop)
-          .toList(),
-      processingState: _justAudioEvent.errorCode != null
-          ? AudioProcessingState.error
-          : const {
-                ProcessingStateMessage.idle: AudioProcessingState.idle,
-                ProcessingStateMessage.loading: AudioProcessingState.loading,
-                ProcessingStateMessage.buffering:
-                    AudioProcessingState.buffering,
-                ProcessingStateMessage.ready: AudioProcessingState.ready,
-                ProcessingStateMessage.completed:
-                    AudioProcessingState.completed,
-              }[_justAudioEvent.processingState] ??
-              AudioProcessingState.idle,
-      playing: _playing &&
-          !{ProcessingStateMessage.idle, ProcessingStateMessage.completed}
-              .contains(_justAudioEvent.processingState),
-      updatePosition: currentPosition,
-      bufferedPosition: _justAudioEvent.bufferedPosition,
-      speed: _speed,
-      queueIndex: _justAudioEvent.currentIndex,
-      errorCode: _justAudioEvent.errorCode,
-      errorMessage: _justAudioEvent.errorMessage,
-    ));
+    final notificationConfig = _notificationConfigBuilder(
+      this,
+      hasPrevious,
+      hasNext,
+    );
+    playbackState.add(
+      playbackState.nvalue!.copyWith(
+        controls: notificationConfig.controls,
+        systemActions: notificationConfig.systemActions,
+        androidCompactActionIndices:
+            notificationConfig.androidCompactActionIndices,
+        processingState: const {
+              ProcessingStateMessage.idle: AudioProcessingState.idle,
+              ProcessingStateMessage.loading: AudioProcessingState.loading,
+              ProcessingStateMessage.buffering: AudioProcessingState.buffering,
+              ProcessingStateMessage.ready: AudioProcessingState.ready,
+              ProcessingStateMessage.completed: AudioProcessingState.completed,
+            }[_justAudioEvent.processingState] ??
+            AudioProcessingState.idle,
+        playing: _playing &&
+            !{ProcessingStateMessage.idle, ProcessingStateMessage.completed}
+                .contains(_justAudioEvent.processingState),
+        updatePosition: currentPosition,
+        bufferedPosition: _justAudioEvent.bufferedPosition,
+        speed: _speed,
+        queueIndex: _justAudioEvent.currentIndex,
+        errorCode: _justAudioEvent.errorCode,
+        errorMessage: _justAudioEvent.errorMessage,
+      ),
+    );
   }
 }
 
@@ -955,3 +983,48 @@ class _ValueCompleter<T> {
 
   Future<T> get future => _completer.future;
 }
+
+/// Notification config, used to set system notification properties.
+@immutable
+class AudioNotificationConfig {
+  const AudioNotificationConfig({
+    this.controls = const [],
+    this.systemActions = const {},
+    this.androidCompactActionIndices,
+  });
+
+  /// Not supported starting with Android 13 (API level 33)
+  ///
+  /// More info: https://developer.android.com/about/versions/13/behavior-changes-13#playback-controls
+  final List<int>? androidCompactActionIndices;
+  final List<MediaControl> controls;
+  final Set<MediaAction> systemActions;
+
+  @override
+  String toString() =>
+      'NotificationConfig(androidCompactActionIndices: $androidCompactActionIndices, controls: $controls, systemActions: $systemActions)';
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AudioNotificationConfig &&
+          runtimeType == other.runtimeType &&
+          listEquals(
+              androidCompactActionIndices, other.androidCompactActionIndices) &&
+          listEquals(controls, other.controls) &&
+          setEquals(systemActions, other.systemActions);
+
+  @override
+  int get hashCode =>
+      androidCompactActionIndices.hashCode ^
+      controls.hashCode ^
+      systemActions.hashCode;
+}
+
+/// Type signature for a function that builds an [AudioNotificationConfig] based
+/// on the current playback state.
+typedef AudioNotificationConfigBuilder = AudioNotificationConfig Function(
+  AudioHandler handler,
+  bool hasPrevious,
+  bool hasNext,
+);
