@@ -9,7 +9,8 @@ import 'package:just_audio_platform_interface/just_audio_platform_interface.dart
 import 'package:rxdart/rxdart.dart';
 import 'package:synchronized/synchronized.dart';
 
-export 'package:audio_service/audio_service.dart' show MediaItem;
+export 'package:audio_service/audio_service.dart'
+    show MediaItem, MediaControl, MediaAction, AudioHandler;
 
 late SwitchAudioHandler _audioHandler;
 late JustAudioPlatform _platform;
